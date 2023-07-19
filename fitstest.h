@@ -12,3 +12,4 @@ cl_context context;
 
 void get_context_from_user(int platform_index, int device_index); 
 double *calculate_potential(double *data, long x_len, long y_len); 
+double *omp_calculate_potential(double* data, long x_len, long y_len);

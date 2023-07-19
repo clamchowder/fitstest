@@ -158,19 +158,51 @@ cl_program build_program(cl_context context, const char* fname)
     return program;
 }
 
+double *omp_calculate_potential(double* data, long x_len, long y_len)
+{
+    size_t buffer_size = sizeof(double) * x_len * y_len;
+    double* results = malloc(buffer_size);
+    double G = 6.67430E-8;         // gravitational constant but with grams not kg
+    double massMul = 2.3 * 1.67E-80;
+    double pxDistance = 1.76E16;    // 1.76E32 sq cm
+
+    int y_pos, x_pos;
+
+#pragma omp parallel for
+    for (y_pos = 0; y_pos < y_len; y_pos++) {
+        for (x_pos = 0; x_pos < x_len; x_pos++) {
+            double acc = 0;
+            for (int x_idx = 0; x_idx < x_len; x_idx++) {
+                for (int y_idx = 0; y_idx < y_len; y_idx++) {
+                    double x_dist = (x_pos - x_idx) * pxDistance;
+                    double y_dist = (y_pos - y_idx) * pxDistance;
+                    acc += G * data[y_idx * x_len + x_idx] * massMul / (x_dist * x_dist + y_dist * y_dist);
+                }
+            }
+
+            results[y_pos * x_len + x_pos] = acc;
+        }
+    }
+    return results;
+}
+
 // compute gravitational potential of column density
 // data = ptr to data array, in row major order
 // x_len = length of horizontal dimension in pixels
 // y_len = length of vertical dimension in pixels
 // returns ptr to results, which must be freed
-double *calculate_potential(double *data, long x_len, long y_len) {
-  cl_int ret;
-  size_t global_size = x_len * y_len;
-  size_t local_size = 256;
-  cl_int x_len_int = (cl_int)x_len;
-  cl_int y_len_int = (cl_int)y_len;
-  cl_program program = build_program(context, "fitskernel.cl");
-  cl_command_queue command_queue = clCreateCommandQueue(context, selected_device_id, 0, &ret);
+double* calculate_potential(double* data, long x_len, long y_len) {
+    cl_int ret;
+    size_t global_size = x_len * y_len;
+    size_t local_size = 256;
+    cl_int x_len_int = (cl_int)x_len;
+    cl_int y_len_int = (cl_int)y_len;
+    cl_program program = build_program(context, "fitskernel.cl");
+    cl_command_queue command_queue = clCreateCommandQueue(context, selected_device_id, 0, &ret);
+    if (ret != CL_SUCCESS) {
+        fprintf(stderr, "Failed to create command queue: %d\n", ret);
+    }
+
   cl_kernel kernel = clCreateKernel(program, "calculate_potential", &ret);
   size_t buffer_size = sizeof(double) * x_len * y_len;
 
@@ -182,8 +214,8 @@ double *calculate_potential(double *data, long x_len, long y_len) {
   ret = clEnqueueWriteBuffer(command_queue, data_mem, CL_FALSE, 0, buffer_size, data, 0, NULL, NULL);
   ret = clEnqueueWriteBuffer(command_queue, results_mem, CL_FALSE, 0, buffer_size, results, 0, NULL, NULL);
   clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&data_mem);
-  clSetKernelArg(kernel, 1, sizeof(cl_long), (void *)&x_len);
-  clSetKernelArg(kernel, 2, sizeof(cl_long), (void *)&y_len);
+  clSetKernelArg(kernel, 1, sizeof(cl_int), (void *)&x_len_int);
+  clSetKernelArg(kernel, 2, sizeof(cl_int), (void *)&y_len_int);
   clSetKernelArg(kernel, 3, sizeof(cl_mem), (void *)&results_mem);
   clFinish(command_queue);
 
@@ -196,6 +228,7 @@ double *calculate_potential(double *data, long x_len, long y_len) {
     fprintf(stderr, "Failed to submit kernel: %d\n", ret);
     goto calculate_potential_end;
   }
+
   ret = clFinish(command_queue);
   if (ret != CL_SUCCESS) {
     fprintf(stderr, "Failed to finish command queue: %d\n", ret);

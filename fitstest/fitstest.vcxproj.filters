@@ -26,17 +26,14 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <None Include="..\fitskernel.cl">
-      <Filter>Source Files</Filter>
-    </None>
-    <None Include="cfitsio.dll" />
-  </ItemGroup>
-  <ItemGroup>
     <ClInclude Include="..\fitstest.h">
       <Filter>Source Files</Filter>
     </ClInclude>
     <ClInclude Include="..\timing.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <CopyFileToFolders Include="..\fitskernel.cl" />
   </ItemGroup>
 </Project>
