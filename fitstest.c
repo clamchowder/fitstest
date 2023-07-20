@@ -1,4 +1,9 @@
 #include "fitstest.h"
+#include <string.h>
+
+#ifndef _MSC_VER
+#define _strnicmp strncmp
+#endif
 
 int main(int argc, char* argv[]) {
     int rc = 0, status = 0;
