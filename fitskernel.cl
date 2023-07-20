@@ -17,7 +17,7 @@ __kernel void calculate_potential(__global double *data, int x_len, int y_len, _
       double x_dist = (x_pos - x_idx) * pxDistance;
       double y_dist = (y_pos - y_idx) * pxDistance;
       if (y_idx == y_pos && x_idx == x_pos) continue;
-      acc += G * data[y_idx * x_len + x_idx] * massMul * native_recip(x_dist * x_dist + y_dist * y_dist);
+      acc += G * data[y_idx * x_len + x_idx] * massMul * native_rsqrt(x_dist * x_dist + y_dist * y_dist);
     }
   }
 
