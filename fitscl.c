@@ -1,5 +1,7 @@
 #include "fitstest.h"
 
+#include <immintrin.h>
+
 cl_device_id selected_device_id;     
 cl_platform_id selected_platform_id; 
 cl_context context;                  
@@ -158,14 +160,14 @@ cl_program build_program(cl_context context, const char* fname)
     return program;
 }
 
+double G = 6.67430E-8;         // gravitational constant but with grams not kg
+double massMul = 1; //2.3 * 1.67E-80;
+double pxDistance = 1; //1.76E16;    // 1.76E32 sq cm
+
 double *omp_calculate_potential(double* data, long x_len, long y_len)
 {
     size_t buffer_size = sizeof(double) * x_len * y_len;
     double* results = malloc(buffer_size);
-    double G = 6.67430E-8;         // gravitational constant but with grams not kg
-    double massMul = 2.3 * 1.67E-80;
-    double pxDistance = 1.76E16;    // 1.76E32 sq cm
-
     int y_pos, x_pos;
 
 #pragma omp parallel for
@@ -188,6 +190,80 @@ double *omp_calculate_potential(double* data, long x_len, long y_len)
     return results;
 }
 
+// attempt at writing an avx version
+double* omp_calculate_potential_avx(double* data, long x_len, long y_len)
+{
+    size_t buffer_size = sizeof(double) * x_len * y_len;
+    double* results = malloc(buffer_size);
+    int y_pos, x_pos;
+
+    uint64_t pixel_offsets_arr[4] = {0, 1, 2, 3};
+    uint32_t pixel_offsets_arr_32[4] = { 0, 1, 2, 3 };
+    __m256i pixel_offsets_64b = _mm256_loadu_epi64(pixel_offsets_arr);
+    __m128i pixel_offsets_32b = _mm_loadu_epi32(pixel_offsets_arr_32);
+    __m256i x_len_vec = _mm256_set1_epi64x(x_len);
+    __m256d distance_vec = _mm256_set1_pd(pxDistance);
+    __m256d g_vec = _mm256_set1_pd(G);
+    __m256d massMul_vec = _mm256_set1_pd(massMul);
+
+    size_t padded_buffer_size = sizeof(double) * (x_len + 4) * (y_len + 4);
+    long padded_x_len = x_len + 4;
+    double* padded_data = malloc(padded_buffer_size);
+    
+    // pad the right/bottom edges with four extra black pixels
+    for (y_pos = 0; y_pos < y_len + 4; y_pos++)
+        for (x_pos = 0; x_pos < x_len + 4; x_pos++)
+        {
+            padded_data[y_pos * padded_x_len + x_pos] = (y_pos < y_len && x_pos < x_len) ? data[y_pos * x_len + x_pos] : 0;
+        }
+
+#pragma omp parallel for
+    for (y_pos = 0; y_pos < y_len; y_pos++) {
+        // handle 4 px at a time (256-bit)
+        for (x_pos = 0; x_pos < x_len; x_pos += 4) {
+            __m256d acc_pixel_mass = _mm256_loadu_pd(padded_data + (y_pos * padded_x_len + x_pos));
+            acc_pixel_mass = _mm256_mul_pd(acc_pixel_mass, massMul_vec);
+            __m256d acc = _mm256_setzero_pd();
+
+            // acc pixel position in FP64 vector
+            __m128i acc_pixel_offsets_32 = _mm_add_epi32(pixel_offsets_32b, _mm_set1_epi32(x_pos));
+            __m256d acc_pixel_offsets_f64 = _mm256_cvtepi32_pd(acc_pixel_offsets_32);
+            for (int y_idx = 0; y_idx < y_len; y_idx++) {
+                __m256d y_dist_squared = _mm256_mul_pd(_mm256_set1_pd(y_pos - y_idx), distance_vec);
+                y_dist_squared = _mm256_mul_pd(y_dist_squared, y_dist_squared);
+                __m256i y_pos_vec = _mm256_set1_epi64x(y_idx);
+                for (int x_idx = 0; x_idx < x_len; x_idx += 4) {
+                    // generate masks again
+                    __m256i current_pixel_offsets = _mm256_add_epi64(_mm256_set1_epi64x((uint64_t)x_idx), pixel_offsets_64b);
+                    __m256d current_pixel_mass = _mm256_loadu_pd(padded_data + (y_idx * padded_x_len + x_idx));
+                    current_pixel_mass = _mm256_mul_pd(current_pixel_mass, massMul_vec);
+
+                    __m128i current_pixel_offsets_32 = _mm_add_epi32(pixel_offsets_32b, _mm_set1_epi32(x_idx));
+
+                    // generate x distance values as doubles
+                    __m256d current_pixel_offsets_f64 = _mm256_cvtepi32_pd(current_pixel_offsets_32);
+                    __m256d x_dist = _mm256_mul_pd(_mm256_sub_pd(acc_pixel_offsets_f64, current_pixel_offsets_f64), distance_vec);
+
+                    // generate mask for zero distance. compare to put 1s in any element that's zero. then negate by XOR-ing with all 1s
+                    // add y and x (current pixel) offsets. if zero, set bits high in that position. then negate it. need this to be AND-ed with acc
+                    __m256i zero_distance_mask = _mm256_cmpeq_epi64(_mm256_add_epi64(y_pos_vec, current_pixel_offsets), _mm256_setzero_si256());
+                    zero_distance_mask = _mm256_xor_si256(zero_distance_mask, _mm256_set1_epi64x(-1LL));
+                    
+                    // compute (G*m1*m2/d^2)
+                    __m256d numerator = _mm256_mul_pd(current_pixel_mass, acc_pixel_mass);
+                    __m256d denominator = _mm256_fmadd_pd(x_dist, x_dist, y_dist_squared); // multiply first two args, add that to third arg
+                    __m256d divideResult = _mm256_div_pd(numerator, denominator);
+                    __m256d maskResult = _mm256_and_pd(divideResult, _mm256_castsi256_pd(zero_distance_mask)); // divide, and zero it out if distance = 0
+                    acc = _mm256_fmadd_pd(g_vec, maskResult, acc);
+                }
+            }
+
+            _mm256_storeu_pd(results + (y_pos * x_len + x_pos), acc);
+        }
+    }
+    return results;
+}
+
 // compute gravitational potential of column density
 // data = ptr to data array, in row major order
 // x_len = length of horizontal dimension in pixels
@@ -197,6 +273,9 @@ double* calculate_potential(double* data, long x_len, long y_len) {
     cl_int ret;
     size_t global_size = x_len * y_len;
     size_t local_size = 256;
+
+    // Nvidia does not like taking 64-bit integers as kernel arguments. Their runtime will start hurting itself.
+    // 32-bit is fine here because images will not be too big anyway
     cl_int x_len_int = (cl_int)x_len;
     cl_int y_len_int = (cl_int)y_len;
     cl_program program = build_program(context, "fitskernel.cl");
@@ -205,51 +284,51 @@ double* calculate_potential(double* data, long x_len, long y_len) {
         fprintf(stderr, "Failed to create command queue: %d\n", ret);
     }
 
-  cl_kernel kernel = clCreateKernel(program, "calculate_potential", &ret);
-  size_t buffer_size = sizeof(double) * x_len * y_len;
+    cl_kernel kernel = clCreateKernel(program, "calculate_potential", &ret);
+    size_t buffer_size = sizeof(double) * x_len * y_len;
 
-  double *results = malloc(buffer_size);
-  cl_mem results_mem = NULL, data_mem = NULL;
+    double *results = malloc(buffer_size);
+    cl_mem results_mem = NULL, data_mem = NULL;
   
-  data_mem = clCreateBuffer(context, CL_MEM_READ_ONLY, buffer_size, NULL, &ret);
-  results_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, &ret);
-  ret = clEnqueueWriteBuffer(command_queue, data_mem, CL_FALSE, 0, buffer_size, data, 0, NULL, NULL);
-  ret = clEnqueueWriteBuffer(command_queue, results_mem, CL_FALSE, 0, buffer_size, results, 0, NULL, NULL);
-  clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&data_mem);
-  clSetKernelArg(kernel, 1, sizeof(cl_int), (void *)&x_len_int);
-  clSetKernelArg(kernel, 2, sizeof(cl_int), (void *)&y_len_int);
-  clSetKernelArg(kernel, 3, sizeof(cl_mem), (void *)&results_mem);
-  clFinish(command_queue);
+    data_mem = clCreateBuffer(context, CL_MEM_READ_ONLY, buffer_size, NULL, &ret);
+    results_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, &ret);
+    ret = clEnqueueWriteBuffer(command_queue, data_mem, CL_FALSE, 0, buffer_size, data, 0, NULL, NULL);
+    ret = clEnqueueWriteBuffer(command_queue, results_mem, CL_FALSE, 0, buffer_size, results, 0, NULL, NULL);
+    clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&data_mem);
+    clSetKernelArg(kernel, 1, sizeof(cl_int), (void *)&x_len_int);
+    clSetKernelArg(kernel, 2, sizeof(cl_int), (void *)&y_len_int);
+    clSetKernelArg(kernel, 3, sizeof(cl_mem), (void *)&results_mem);
+    clFinish(command_queue);
 
-  if (global_size % local_size != 0) global_size += (local_size - (global_size % local_size));
+    if (global_size % local_size != 0) global_size += (local_size - (global_size % local_size));
 
-  printf("Submitting kernel to GPU\n");
-  start_timing();
-  ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL);
-  if (ret != CL_SUCCESS) {
-    fprintf(stderr, "Failed to submit kernel: %d\n", ret);
-    goto calculate_potential_end;
-  }
+    printf("Submitting kernel to GPU\n");
+    start_timing();
+    ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL);
+    if (ret != CL_SUCCESS) {
+        fprintf(stderr, "Failed to submit kernel: %d\n", ret);
+        goto calculate_potential_end;
+    }
 
-  ret = clFinish(command_queue);
-  if (ret != CL_SUCCESS) {
-    fprintf(stderr, "Failed to finish command queue: %d\n", ret);
-    goto calculate_potential_end;
-  }
+    ret = clFinish(command_queue);
+    if (ret != CL_SUCCESS) {
+        fprintf(stderr, "Failed to finish command queue: %d\n", ret);
+        goto calculate_potential_end;
+    }
   
-  printf("%d ms\n", end_timing());
+    printf("%d ms\n", end_timing());
 
-  ret = clEnqueueReadBuffer(command_queue, results_mem, CL_TRUE, 0, buffer_size, results, 0, NULL, NULL);
-  if (ret != CL_SUCCESS) {
-    fprintf(stderr, "Failed to copy results from GPU: %d\n", ret);
-  }
+    ret = clEnqueueReadBuffer(command_queue, results_mem, CL_TRUE, 0, buffer_size, results, 0, NULL, NULL);
+    if (ret != CL_SUCCESS) {
+        fprintf(stderr, "Failed to copy results from GPU: %d\n", ret);
+    }
 
-  printf("Finished copying results back from GPU\n");
+    printf("Finished copying results back from GPU\n");
 
 calculate_potential_end:
-  clFlush(command_queue);
-  clFinish(command_queue);
-  clReleaseMemObject(data_mem);
-  clReleaseMemObject(results_mem);
-  return results;
+    clFlush(command_queue);
+    clFinish(command_queue);
+    clReleaseMemObject(data_mem);
+    clReleaseMemObject(results_mem);
+    return results;
 }
