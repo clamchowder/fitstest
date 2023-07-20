@@ -12,14 +12,16 @@ int main(int argc, char* argv[]) {
 
     for (int argIdx = 1; argIdx < argc; argIdx++) {
         if (*argv[argIdx] == '-') {
-            char arg = argv[argIdx] + 1;
+            char *arg = argv[argIdx] + 1;
             if (_strnicmp(arg, "in", 2) == 0) {
                 argIdx++;
-                input_file_name = argv + argIdx;
+                input_file_name = argv[argIdx];
+                printf("Input file: %s\n", input_file_name);
             }
             else if (_strnicmp(arg, "out", 3) == 0) {
                 argIdx++;
                 output_file_name = argv[argIdx];
+                printf("Output file: %s\n", output_file_name);
             }
             else if (_strnicmp(arg, "platform", 9) == 0) {
                 argIdx++;
@@ -45,7 +47,7 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    rc = fits_open_image(&input_file, argv[1], READONLY, &status);
+    rc = fits_open_image(&input_file, input_file_name, READONLY, &status);
     if (rc) {
         fits_report_error(stderr, status);
         return 0;

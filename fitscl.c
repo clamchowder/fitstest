@@ -171,12 +171,14 @@ double *omp_calculate_potential(double* data, long x_len, long y_len)
 #pragma omp parallel for
     for (y_pos = 0; y_pos < y_len; y_pos++) {
         for (x_pos = 0; x_pos < x_len; x_pos++) {
+            double m = data[y_pos * x_len + y_pos] * massMul;
             double acc = 0;
             for (int x_idx = 0; x_idx < x_len; x_idx++) {
                 for (int y_idx = 0; y_idx < y_len; y_idx++) {
                     double x_dist = (x_pos - x_idx) * pxDistance;
                     double y_dist = (y_pos - y_idx) * pxDistance;
-                    acc += G * data[y_idx * x_len + x_idx] * massMul / (x_dist * x_dist + y_dist * y_dist);
+                    if (x_dist == 0 && y_dist == 0) continue;
+                    acc += G * m * data[y_idx * x_len + x_idx] * massMul / (x_dist * x_dist + y_dist * y_dist);
                 }
             }
 
