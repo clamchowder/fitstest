@@ -1,6 +1,7 @@
 #include "fitstest.h"
 
 #include <immintrin.h>
+#include <math.h>
 
 cl_device_id selected_device_id;     
 cl_platform_id selected_platform_id; 
@@ -170,10 +171,12 @@ double *omp_calculate_potential(double* data, long x_len, long y_len)
     double* results = malloc(buffer_size);
     int y_pos, x_pos;
 
+    fprintf(stderr, "Using OpenMP and C code\n");
+
 #pragma omp parallel for
     for (y_pos = 0; y_pos < y_len; y_pos++) {
         for (x_pos = 0; x_pos < x_len; x_pos++) {
-            double m = data[y_pos * x_len + y_pos] * massMul;
+            double m = data[y_pos * x_len + x_pos] * massMul;
             double acc = 0;
             for (int x_idx = 0; x_idx < x_len; x_idx++) {
                 for (int y_idx = 0; y_idx < y_len; y_idx++) {
@@ -193,6 +196,7 @@ double *omp_calculate_potential(double* data, long x_len, long y_len)
 // attempt at writing an avx version
 double* omp_calculate_potential_avx(double* data, long x_len, long y_len)
 {
+#ifdef _MSC_VER
     size_t buffer_size = sizeof(double) * x_len * y_len;
     double* results = malloc(buffer_size);
     int y_pos, x_pos;
@@ -209,6 +213,13 @@ double* omp_calculate_potential_avx(double* data, long x_len, long y_len)
     size_t padded_buffer_size = sizeof(double) * (x_len + 4) * (y_len + 4);
     long padded_x_len = x_len + 4;
     double* padded_data = malloc(padded_buffer_size);
+    if (padded_data == NULL)
+    {
+        fprintf(stderr, "Could not allocate memory for padded buffer\n");
+        return results;
+    }
+
+    fprintf(stderr, "Using AVX2 intrinsics\n");
     
     // pad the right/bottom edges with four extra black pixels
     for (y_pos = 0; y_pos < y_len + 4; y_pos++)
@@ -216,6 +227,8 @@ double* omp_calculate_potential_avx(double* data, long x_len, long y_len)
         {
             padded_data[y_pos * padded_x_len + x_pos] = (y_pos < y_len && x_pos < x_len) ? data[y_pos * x_len + x_pos] : 0;
         }
+
+    start_timing();
 
 #pragma omp parallel for
     for (y_pos = 0; y_pos < y_len; y_pos++) {
@@ -233,35 +246,49 @@ double* omp_calculate_potential_avx(double* data, long x_len, long y_len)
                 y_dist_squared = _mm256_mul_pd(y_dist_squared, y_dist_squared);
                 __m256i y_pos_vec = _mm256_set1_epi64x(y_idx);
                 for (int x_idx = 0; x_idx < x_len; x_idx += 4) {
-                    // generate masks again
-                    __m256i current_pixel_offsets = _mm256_add_epi64(_mm256_set1_epi64x((uint64_t)x_idx), pixel_offsets_64b);
-                    __m256d current_pixel_mass = _mm256_loadu_pd(padded_data + (y_idx * padded_x_len + x_idx));
-                    current_pixel_mass = _mm256_mul_pd(current_pixel_mass, massMul_vec);
+                    if (y_idx == y_pos && x_idx == x_pos) { // should be equal bc both move by 4
+                        // handle acc for four pixels
+                        double temp_acc[4];
+                        double y_dist = y_idx - y_pos;
+                        for (int mini_x_pos = x_pos; mini_x_pos < x_pos + 4; mini_x_pos++) {
+                            double m = data[y_pos * x_len + mini_x_pos] * massMul;
+                            for (int mini_x_idx = x_idx; mini_x_idx < x_idx + 4; mini_x_idx++) {
+                                if (mini_x_pos == mini_x_idx) continue;
+                                double x_dist = mini_x_idx - mini_x_pos;
+                                temp_acc[mini_x_pos - x_pos] = G * m * data[y_idx * x_len + x_idx] * massMul / sqrt(x_dist * x_dist + y_dist * y_dist);
+                            }
+                        }
 
-                    __m128i current_pixel_offsets_32 = _mm_add_epi32(pixel_offsets_32b, _mm_set1_epi32(x_idx));
+                        __m256d temp_acc_vec = _mm256_loadu_pd(temp_acc);
+                        acc = _mm256_add_pd(acc, temp_acc_vec);
+                    }
+                    else {
+                        __m256d current_pixel_mass = _mm256_loadu_pd(padded_data + (y_idx * padded_x_len + x_idx));
+                        current_pixel_mass = _mm256_mul_pd(current_pixel_mass, massMul_vec);
 
-                    // generate x distance values as doubles
-                    __m256d current_pixel_offsets_f64 = _mm256_cvtepi32_pd(current_pixel_offsets_32);
-                    __m256d x_dist = _mm256_mul_pd(_mm256_sub_pd(acc_pixel_offsets_f64, current_pixel_offsets_f64), distance_vec);
+                        __m128i current_pixel_offsets_32 = _mm_add_epi32(pixel_offsets_32b, _mm_set1_epi32(x_idx));
 
-                    // generate mask for zero distance. compare to put 1s in any element that's zero. then negate by XOR-ing with all 1s
-                    // add y and x (current pixel) offsets. if zero, set bits high in that position. then negate it. need this to be AND-ed with acc
-                    __m256i zero_distance_mask = _mm256_cmpeq_epi64(_mm256_add_epi64(y_pos_vec, current_pixel_offsets), _mm256_setzero_si256());
-                    zero_distance_mask = _mm256_xor_si256(zero_distance_mask, _mm256_set1_epi64x(-1LL));
-                    
-                    // compute (G*m1*m2/d^2)
-                    __m256d numerator = _mm256_mul_pd(current_pixel_mass, acc_pixel_mass);
-                    __m256d denominator = _mm256_fmadd_pd(x_dist, x_dist, y_dist_squared); // multiply first two args, add that to third arg
-                    __m256d divideResult = _mm256_div_pd(numerator, denominator);
-                    __m256d maskResult = _mm256_and_pd(divideResult, _mm256_castsi256_pd(zero_distance_mask)); // divide, and zero it out if distance = 0
-                    acc = _mm256_fmadd_pd(g_vec, maskResult, acc);
+                        // generate x distance values as doubles
+                        __m256d current_pixel_offsets_f64 = _mm256_cvtepi32_pd(current_pixel_offsets_32);
+                        __m256d x_dist = _mm256_mul_pd(_mm256_sub_pd(acc_pixel_offsets_f64, current_pixel_offsets_f64), distance_vec);
+
+                        // compute (G*m1*m2/d^2)
+                        __m256d numerator = _mm256_mul_pd(current_pixel_mass, acc_pixel_mass);
+                        __m256d denominator = _mm256_sqrt_pd(_mm256_fmadd_pd(x_dist, x_dist, y_dist_squared)); // multiply first two args, add that to third arg
+                        __m256d divideResult = _mm256_div_pd(numerator, denominator);
+                        acc = _mm256_fmadd_pd(g_vec, divideResult, acc);
+                    }
                 }
             }
 
             _mm256_storeu_pd(results + (y_pos * x_len + x_pos), acc);
         }
     }
+
+    printf("%d ms\n", end_timing());
+    free(padded_data);
     return results;
+#endif
 }
 
 // compute gravitational potential of column density

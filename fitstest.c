@@ -119,7 +119,11 @@ int main(int argc, char* argv[]) {
         results = calculate_potential(input_data, axes_len[0], axes_len[1]);
     }
     else {
+#ifndef _MSC_VER
         results = omp_calculate_potential(input_data, axes_len[0], axes_len[1]);
+#else
+        results = omp_calculate_potential_avx(input_data, axes_len[0], axes_len[1]);
+#endif
     }
 ;
     rc = fits_create_file(&output_file, output_file_name, &status);
