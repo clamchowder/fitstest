@@ -249,13 +249,17 @@ double* omp_calculate_potential_avx(double* data, long x_len, long y_len)
                     if (y_idx == y_pos && x_idx == x_pos) { // should be equal bc both move by 4
                         // handle acc for four pixels
                         double temp_acc[4];
+                        temp_acc[0] = 0;
+                        temp_acc[1] = 0;
+                        temp_acc[2] = 0;
+                        temp_acc[3] = 0;
                         double y_dist = y_idx - y_pos;
                         for (int mini_x_pos = x_pos; mini_x_pos < x_pos + 4; mini_x_pos++) {
                             double m = data[y_pos * x_len + mini_x_pos] * massMul;
                             for (int mini_x_idx = x_idx; mini_x_idx < x_idx + 4; mini_x_idx++) {
                                 if (mini_x_pos == mini_x_idx) continue;
                                 double x_dist = mini_x_idx - mini_x_pos;
-                                temp_acc[mini_x_pos - x_pos] = G * m * data[y_idx * x_len + x_idx] * massMul / sqrt(x_dist * x_dist + y_dist * y_dist);
+                                temp_acc[mini_x_pos - x_pos] += G * m * data[y_idx * x_len + x_idx] * massMul / sqrt(x_dist * x_dist + y_dist * y_dist);
                             }
                         }
 
@@ -295,8 +299,9 @@ double* omp_calculate_potential_avx(double* data, long x_len, long y_len)
 // data = ptr to data array, in row major order
 // x_len = length of horizontal dimension in pixels
 // y_len = length of vertical dimension in pixels
+// fp32 = if true, use fp32 for calculations
 // returns ptr to results, which must be freed
-double* calculate_potential(double* data, long x_len, long y_len) {
+double* calculate_potential(double* data, long x_len, long y_len, int fp32) {
     cl_int ret;
     size_t global_size = x_len * y_len;
     size_t local_size = 256;
@@ -311,16 +316,36 @@ double* calculate_potential(double* data, long x_len, long y_len) {
         fprintf(stderr, "Failed to create command queue: %d\n", ret);
     }
 
-    cl_kernel kernel = clCreateKernel(program, "calculate_potential", &ret);
+    cl_kernel kernel = clCreateKernel(program, fp32 ? "calculate_potential_fp32" : "calculate_potential", &ret);
     size_t buffer_size = sizeof(double) * x_len * y_len;
+    size_t sp_buffer_size = sizeof(float) * x_len * y_len;
 
-    double *results = malloc(buffer_size);
+    double* results = malloc(buffer_size);
     cl_mem results_mem = NULL, data_mem = NULL;
-  
-    data_mem = clCreateBuffer(context, CL_MEM_READ_ONLY, buffer_size, NULL, &ret);
-    results_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, &ret);
-    ret = clEnqueueWriteBuffer(command_queue, data_mem, CL_FALSE, 0, buffer_size, data, 0, NULL, NULL);
-    ret = clEnqueueWriteBuffer(command_queue, results_mem, CL_FALSE, 0, buffer_size, results, 0, NULL, NULL);
+    float* sp_input = NULL, *sp_results = NULL;
+
+    if (fp32)
+    {
+        sp_input = malloc(sp_buffer_size);
+        for (int y_pos = 0; y_pos < y_len; y_pos++)
+            for (int x_pos = 0; x_pos < x_len; x_pos++)
+                sp_input[y_pos * x_len + x_pos] = (float)data[y_pos * x_len + x_pos];
+
+        sp_results = malloc(sp_buffer_size);
+
+        data_mem = clCreateBuffer(context, CL_MEM_READ_ONLY, sp_buffer_size, NULL, &ret);
+        results_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, sp_buffer_size, NULL, &ret);
+        ret = clEnqueueWriteBuffer(command_queue, data_mem, CL_FALSE, 0, sp_buffer_size, sp_input, 0, NULL, NULL);
+        ret = clEnqueueWriteBuffer(command_queue, results_mem, CL_FALSE, 0, sp_buffer_size, sp_results, 0, NULL, NULL);
+    }
+    else
+    {
+        data_mem = clCreateBuffer(context, CL_MEM_READ_ONLY, buffer_size, NULL, &ret);
+        results_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, &ret);
+        ret = clEnqueueWriteBuffer(command_queue, data_mem, CL_FALSE, 0, sp_buffer_size, data, 0, NULL, NULL);
+        ret = clEnqueueWriteBuffer(command_queue, results_mem, CL_FALSE, 0, sp_buffer_size, results, 0, NULL, NULL);
+    }
+
     clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&data_mem);
     clSetKernelArg(kernel, 1, sizeof(cl_int), (void *)&x_len_int);
     clSetKernelArg(kernel, 2, sizeof(cl_int), (void *)&y_len_int);
@@ -345,12 +370,21 @@ double* calculate_potential(double* data, long x_len, long y_len) {
   
     printf("%d ms\n", end_timing());
 
-    ret = clEnqueueReadBuffer(command_queue, results_mem, CL_TRUE, 0, buffer_size, results, 0, NULL, NULL);
+    ret = clEnqueueReadBuffer(command_queue, results_mem, CL_TRUE, 0, fp32 ? sp_buffer_size : buffer_size, fp32 ? sp_results : results, 0, NULL, NULL);
     if (ret != CL_SUCCESS) {
         fprintf(stderr, "Failed to copy results from GPU: %d\n", ret);
     }
 
     printf("Finished copying results back from GPU\n");
+
+    if (fp32)
+    {
+        for (int y_pos = 0; y_pos < y_len; y_pos++)
+            for (int x_pos = 0; x_pos < x_len; x_pos++)
+                results[y_pos * x_len + x_pos] = sp_results[y_pos * x_len + x_pos];
+        free(sp_input);
+        free(sp_results);
+    }
 
 calculate_potential_end:
     clFlush(command_queue);
