@@ -342,8 +342,8 @@ double* calculate_potential(double* data, long x_len, long y_len, int fp32) {
     {
         data_mem = clCreateBuffer(context, CL_MEM_READ_ONLY, buffer_size, NULL, &ret);
         results_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, &ret);
-        ret = clEnqueueWriteBuffer(command_queue, data_mem, CL_FALSE, 0, sp_buffer_size, data, 0, NULL, NULL);
-        ret = clEnqueueWriteBuffer(command_queue, results_mem, CL_FALSE, 0, sp_buffer_size, results, 0, NULL, NULL);
+        ret = clEnqueueWriteBuffer(command_queue, data_mem, CL_FALSE, 0, buffer_size, data, 0, NULL, NULL);
+        ret = clEnqueueWriteBuffer(command_queue, results_mem, CL_FALSE, 0, buffer_size, results, 0, NULL, NULL);
     }
 
     clSetKernelArg(kernel, 0, sizeof(cl_mem), (void *)&data_mem);
