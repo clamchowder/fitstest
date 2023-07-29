@@ -4,8 +4,9 @@
 #include <math.h>
 
 cl_device_id selected_device_id;     
-cl_platform_id selected_platform_id; 
-cl_context context;                  
+cl_platform_id selected_platform_id;
+cl_context context;                 
+cl_command_queue command_queue;
 
 /// <summary>
 /// populate global variables for opencl device id and platform id
@@ -119,9 +120,14 @@ void get_context_from_user(int platform_index, int device_index) {
 
     selected_device_id = devices[selected_device_index];
 
-    // Create an OpenCL context
+    // Create an OpenCL context and command queue
     context = clCreateContext(NULL, 1, &selected_device_id, NULL, NULL, &ret);
     fprintf(stderr, "clCreateContext returned %d\n", ret);
+
+    command_queue = clCreateCommandQueue(context, selected_device_id, 0, &ret);
+    if (ret != CL_SUCCESS) {
+        fprintf(stderr, "Failed to create command queue: %d\n", ret);
+    }
 
 get_context_from_user_end:
     free(platforms);
@@ -161,6 +167,39 @@ cl_program build_program(cl_context context, const char* fname)
     return program;
 }
 
+/// <summary>
+/// Zero-pads an image to produce one of a larger size
+/// </summary>
+/// <param name="data">Original image data</param>
+/// <param name="x_len">Original image column count</param>
+/// <param name="y_len">Original image row count</param>
+/// <param name="new_x_len">New column count</param>
+/// <param name="new_y_len">New row count</param>
+/// <returns>Padded image</returns>
+double* pad_image(double* data, long x_len, long y_len, long new_x_len, long new_y_len)
+{
+    long y_pos;
+    size_t buffer_size = sizeof(double) * new_x_len * new_y_len;
+    double* new_buffer = malloc(buffer_size);
+    if (new_buffer == NULL) {
+        fprintf(stderr, "Failed to allocate memory for padded buffer\n");
+        return NULL;
+    }
+
+    memset(new_buffer, 0, buffer_size);
+
+#pragma omp parallel for
+    for (y_pos = 0; y_pos < y_len; y_pos++)
+    {
+        for (long x_pos = 0; x_pos < x_len; x_pos++)
+        {
+            new_buffer[y_pos * new_x_len + x_pos] = data[y_pos * x_len + x_pos];
+        }
+    }
+
+    return new_buffer;
+}
+
 double G = 6.67430E-8;         // gravitational constant but with grams not kg
 double massMul = 1; //2.3 * 1.67E-80;
 double pxDistance = 1; //1.76E16;    // 1.76E32 sq cm
@@ -169,13 +208,13 @@ double *omp_calculate_potential(double* data, long x_len, long y_len)
 {
     size_t buffer_size = sizeof(double) * x_len * y_len;
     double* results = malloc(buffer_size);
-    int y_pos, x_pos;
+    int y_pos;
 
     fprintf(stderr, "Using OpenMP and C code\n");
 
 #pragma omp parallel for
     for (y_pos = 0; y_pos < y_len; y_pos++) {
-        for (x_pos = 0; x_pos < x_len; x_pos++) {
+        for (int x_pos = 0; x_pos < x_len; x_pos++) {
             double m = data[y_pos * x_len + x_pos] * massMul;
             double acc = 0;
             for (int x_idx = 0; x_idx < x_len; x_idx++) {
@@ -295,13 +334,113 @@ double* omp_calculate_potential_avx(double* data, long x_len, long y_len)
 #endif
 }
 
+#define WORKGROUP_SIZE 256
+double* calculate_potential_incremental_ocl(double* data, long x_len, long y_len, int fp32) {
+    cl_int ret;
+    cl_program program = build_program(context, "fitskernel.cl");
+    cl_kernel kernel = clCreateKernel(program, "calculate_potential_partial", &ret);
+    size_t buffer_size = sizeof(double) * x_len * y_len;
+    long required_x_len = x_len;
+    double* padded_data = data;
+
+    if (fp32) fprintf(stderr, "Note, FP32 not implemented for incremental calculation\n");
+    
+    // column count (row length) must be divisible by 256
+    if (x_len % WORKGROUP_SIZE != 0) {
+        required_x_len = WORKGROUP_SIZE * ((x_len / WORKGROUP_SIZE) + 1);
+        fprintf(stderr, "Padding image to row length %l\n", required_x_len);
+        buffer_size = sizeof(double) * required_x_len * y_len;
+        padded_data = pad_image(data, x_len, y_len, required_x_len, y_len);
+    }
+
+    double* results = malloc(buffer_size);
+    cl_mem data_mem, results_mem;
+    cl_int y_len_int = (cl_int)y_len;
+    cl_int x_len_int = (cl_int)required_x_len;
+    cl_int rows_per_kernel = 1;
+
+    data_mem = clCreateBuffer(context, CL_MEM_READ_ONLY, buffer_size, NULL, &ret);
+    if (ret != CL_SUCCESS)
+    {
+        fprintf(stderr, "Failed to allocate padded data buffer\n");
+    }
+
+    results_mem = clCreateBuffer(context, CL_MEM_READ_WRITE, buffer_size, NULL, &ret);
+    if (ret != CL_SUCCESS)
+    {
+        fprintf(stderr, "Failed to allocate padded results buffer\n");
+    }
+
+    ret = clEnqueueWriteBuffer(command_queue, data_mem, CL_FALSE, 0, buffer_size, padded_data, 0, NULL, NULL);
+    ret = clEnqueueWriteBuffer(command_queue, results_mem, CL_FALSE, 0, buffer_size, results, 0, NULL, NULL);
+
+    // 0: __global double *data
+    // 1: int x_len
+    // 2: int y_len
+    // 3: int y_offset
+    // 4: int y_count
+    // 5: __global double *result
+    clSetKernelArg(kernel, 0, sizeof(cl_mem), (void*)&data_mem);
+    clSetKernelArg(kernel, 1, sizeof(cl_int), (void*)&x_len_int);
+    clSetKernelArg(kernel, 2, sizeof(cl_int), (void*)&y_len_int);
+    clSetKernelArg(kernel, 3, sizeof(cl_int), (void*)&rows_per_kernel);
+    clSetKernelArg(kernel, 4, sizeof(cl_int), (void*)&rows_per_kernel);
+    clSetKernelArg(kernel, 5, sizeof(cl_mem), (void*)&results_mem);
+    clFinish(command_queue);
+
+    int time_diff_ms;
+    start_timing();
+    for (long row = 0; row < y_len; row += rows_per_kernel)
+    {
+        cl_int y_count_int = (cl_int)row;
+        clSetKernelArg(kernel, 3, sizeof(cl_int), (void*)&y_count_int);
+
+        // use the unpadded length because we don't use values calculated for positions outside
+        // the original image. works as long as we go one row at a time
+        size_t global_size = WORKGROUP_SIZE * x_len * rows_per_kernel;
+        size_t local_size = WORKGROUP_SIZE;
+        ret = clEnqueueNDRangeKernel(command_queue, kernel, 1, NULL, &global_size, &local_size, 0, NULL, NULL);
+        if (ret != CL_SUCCESS) {
+            fprintf(stderr, "Failed to submit kernel: %d\n", ret);
+            break;
+        }
+
+        clFinish(command_queue);
+        time_diff_ms = end_timing();
+        float seconds_elapsed = time_diff_ms / 1000;
+        float pixels_processed_k = row * x_len / 1000;
+        fprintf(stderr, "%f K pixels/sec\n", pixels_processed_k / seconds_elapsed);
+    }
+
+    ret = clEnqueueReadBuffer(command_queue, results_mem, CL_TRUE, 0, buffer_size, results, 0, NULL, NULL);
+    if (ret != CL_SUCCESS) {
+        fprintf(stderr, "Failed to copy results from GPU: %d\n", ret);
+    }
+    
+
+    if (padded_data != data) {
+        // un-pad results
+        double* padded_results = results;
+        results = malloc(sizeof(double) * x_len * y_len);
+        for (long y_pos = 0; y_pos < y_len; y_pos++)
+            for (long x_pos = 0; x_pos < x_len; x_pos++)
+                results[y_pos * x_len + x_pos] = padded_results[y_pos * required_x_len + x_pos];
+        free(padded_results);
+        free(padded_data);
+    }
+
+    clReleaseMemObject(data_mem);
+    clReleaseMemObject(results_mem);
+    return results;
+}
+
 // compute gravitational potential of column density
 // data = ptr to data array, in row major order
 // x_len = length of horizontal dimension in pixels
 // y_len = length of vertical dimension in pixels
 // fp32 = if true, use fp32 for calculations
 // returns ptr to results, which must be freed
-double* calculate_potential(double* data, long x_len, long y_len, int fp32) {
+double* calculate_potential_ocl(double* data, long x_len, long y_len, int fp32) {
     cl_int ret;
     size_t global_size = x_len * y_len;
     size_t local_size = 256;
@@ -311,11 +450,6 @@ double* calculate_potential(double* data, long x_len, long y_len, int fp32) {
     cl_int x_len_int = (cl_int)x_len;
     cl_int y_len_int = (cl_int)y_len;
     cl_program program = build_program(context, "fitskernel.cl");
-    cl_command_queue command_queue = clCreateCommandQueue(context, selected_device_id, 0, &ret);
-    if (ret != CL_SUCCESS) {
-        fprintf(stderr, "Failed to create command queue: %d\n", ret);
-    }
-
     cl_kernel kernel = clCreateKernel(program, fp32 ? "calculate_potential_fp32" : "calculate_potential", &ret);
     size_t buffer_size = sizeof(double) * x_len * y_len;
     size_t sp_buffer_size = sizeof(float) * x_len * y_len;

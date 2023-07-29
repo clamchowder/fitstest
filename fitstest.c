@@ -1,5 +1,4 @@
 #include "fitstest.h"
-#include <string.h>
 
 #ifndef _MSC_VER
 #define _strnicmp strncmp
@@ -13,7 +12,7 @@ int main(int argc, char* argv[]) {
     double* input_data = NULL, * results = NULL, zero = 0;
     int platform_index = -1, device_index = -1;
     char* input_file_name = NULL, *output_file_name = NULL;
-    int gpuMode = 1, fp32 = 0;
+    int gpuMode = 1, fp32 = 0, incremental = 0;
 
     for (int argIdx = 1; argIdx < argc; argIdx++) {
         if (*argv[argIdx] == '-') {
@@ -47,6 +46,10 @@ int main(int argc, char* argv[]) {
             else if (_strnicmp(arg, "fp32", 4) == 0) {
                 fp32 = 1;
                 printf("Using FP32 for calculations\n");
+            }
+            else if (_strnicmp(arg, "smallsteps", 10) == 0) {
+                incremental = 1;
+                printf("Going one row at a time to avoid TDR\n");
             }
         }
     }
@@ -120,7 +123,8 @@ int main(int argc, char* argv[]) {
             goto nope;
         }
 
-        results = calculate_potential(input_data, axes_len[0], axes_len[1], fp32);
+        if (incremental) results = calculate_potential_incremental_ocl(input_data, axes_len[0], axes_len[1], fp32);
+        else results = calculate_potential_ocl(input_data, axes_len[0], axes_len[1], fp32);
     }
     else {
 #ifndef _MSC_VER
